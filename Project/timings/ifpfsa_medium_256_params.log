@@ -1,0 +1,10 @@
+Using 2 threads
+  137.681 s (24855769 allocations: 588.99 GiB)
+Using 4 threads
+  102.163 s (24856935 allocations: 588.99 GiB)
+Using 8 threads
+  66.281 s (24856787 allocations: 588.99 GiB)
+Using 16 threads
+  43.866 s (24856624 allocations: 588.99 GiB)
+Using 32 threads
+  35.624 s (24856819 allocations: 588.99 GiB)

@@ -1,0 +1,11 @@
+Using 2 threads
+Profiling threaded proceedure for 2 threads and a b_size of 2
+  5.327 s (24401522 allocations: 7.97 GiB)
+Profiling threaded proceedure for 2 threads and a b_size of 4
+  4.938 s (23421880 allocations: 8.62 GiB)
+Profiling threaded proceedure for 2 threads and a b_size of 8
+  7.288 s (28882900 allocations: 11.55 GiB)
+Profiling threaded proceedure for 2 threads and a b_size of 16
+  11.202 s (45840005 allocations: 18.89 GiB)
+Profiling threaded proceedure for 2 threads and a b_size of 32
+  20.515 s (73027024 allocations: 31.06 GiB)

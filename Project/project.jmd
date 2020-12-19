@@ -1,0 +1,557 @@
+**Author:** Allen Mark Payne
+
+**Email:** ampayne@mit.edu
+
+**Date:** December 18th, 2020
+
+# Setup
+
+```julia
+import Pkg
+Pkg.activate("class_project_env")
+ENV["CONDA_JL_HOME"] = "/home/ampayne/anaconda2/envs/rms_env"
+ENV["PYTHON"] = "/home/ampayne/anaconda2/envs/rms_env/bin/python"
+
+using BenchmarkTools
+using DiffEqBase
+using DiffEqSensitivity
+using Plots
+using ReactionMechanismSimulator
+using Sundials
+
+import ForwardDiff
+
+# Parallel Settings
+using Base.Threads
+Threads.nthreads()
+```
+
+# Load in the Small Mechanism
+
+```julia
+# Native RMS API calls (not my original code if you see this)
+phaseDict = readinput("small_model/chem.rms")
+phaseDict["phase"]["Species"]
+ig = IdealGas(phaseDict["phase"]["Species"], phaseDict["phase"]["Reactions"], name="gas")
+ic = Dict(["T"=>1350.0,"P"=>1e5,"ethane"=>1.0])
+domain, y0, all_params = ConstantTPDomain(phase=ig,initialconds=ic;sensitivity=true)
+```
+
+# Load in the Medium Mechanism (only for Supercloud, which has enough RAM)
+
+```julia
+# Native RMS API calls
+phaseDict = readinput("medium_model/medium_model.rms")
+phaseDict["phase"]["Species"]
+ig = IdealGas(phaseDict["phase"]["Species"], phaseDict["phase"]["Reactions"], name="gas")
+ic = Dict(["T"=>1000,"P"=>2e6,"n-octane"=>1.0])
+domain, y0, all_params = ConstantTPDomain(phase=ig,initialconds=ic;sensitivity=true)
+
+length(y0)
+length(all_params)
+
+```
+
+
+# Get the RMS solution for comparison and testing
+
+```julia
+# Native RMS API Calls
+rms_react = Reactor(domain,y0,(0.0,1e-3); forwardsensitivities=true, p=all_params)
+rms_sol = solve(rms_react.ode, CVODE_BDF(), abstol=1e-20,reltol=1e-12)
+
+# Number of parameters = P = 96
+# Number of solution variables = M = 27
+rms_sol(1e-4)  # M+MxP flattened into a 2619 length vector
+
+@btime solve(rms_react.ode, CVODE_BDF(), abstol=1e-20,reltol=1e-12)
+# 66.215 s (167627971 allocations: 47.03 GiB)
+```
+
+
+# Baseline timing: Forward SA with no Jacobian (auto diff)
+
+```julia
+# My modified code of Reactor() from RMS
+function BaselineReactor(domain::T,y0::Array{W,1},tspan::Tuple,interfaces::Z=[];p::X=DiffEqBase.NullParameters(),forwardsensitivities=false) where {T<:AbstractDomain,W<:Real,Z<:AbstractArray,X}
+    dydt(dy::X,y::T,p::V,t::Q) where {X,T,Q<:Real,V} = dydtreactor!(dy,y,t,domain,interfaces,p=p)
+
+
+    # Baseline setup of forward SA problem without giving the jacobian
+    odefcn = ODEFunction(dydt)
+
+
+    ode = ODEForwardSensitivityProblem(odefcn,y0,tspan,p)
+    recsolver = Sundials.CVODE_BDF(linear_solver=:GMRES)
+
+    return Reactor(domain,ode,recsolver,forwardsensitivities)
+end
+
+baseline_react = BaselineReactor(domain,y0,(0.0,1e-3); forwardsensitivities=true, p=all_params)
+baseline_sol = solve(baseline_react.ode, CVODE_BDF(), abstol=1e-20,reltol=1e-12)
+
+# Number of parameters = P = 96
+# Number of solution variables = M = 27
+isapprox(rms_sol(1e-4), baseline_sol(1e-4))
+
+function baseline_proceedure(rms_domain, u0, ts, params)
+    baseline_react = BaselineReactor(rms_domain,u0,ts; forwardsensitivities=true, p=params)
+    baseline_sol = solve(baseline_react.ode, CVODE_BDF(), abstol=1e-20,reltol=1e-12)
+end
+
+@btime baseline_proceedure(domain, y0, (0.0, 1e-3), all_params)
+# 75.862 s (185529420 allocations: 70.23 GiB)
+```
+
+# Parallelization strategy 1: Forward SA with no Jacobian threaded
+
+```julia
+# Modified RMS Reactor object to handle forward SA in batches using ForwardDiff (FD)
+function ThreadedFDReactor(domain::T,y0::Array{W,1},tspan::Tuple, interfaces::Z=[];p::X=DiffEqBase.NullParameters(), p_batch_size=8) where {T<:AbstractDomain,W<:Real,Z<:AbstractArray,X}
+    dydt(dy::X,y::T,p::V,t::Q) where {X,T,Q<:Real,V} = dydtreactor!(dy,y,t,domain,interfaces,p=p)
+
+    # Create list of Reactor objects (containing ODEForwardSensitivityProblem objects) for each batch of parameters
+    reactor_list = []
+    n_batches = Int64(round(length(p)/p_batch_size, RoundUp))
+    ## Enclose the "fixed" parameters for each batch
+    odefcn = ODEFunction((dy, y, batch_p, t) -> dydt(dy, y, [batch_p; p[p_batch_size+1:end]], t))
+    ode = ODEForwardSensitivityProblem(odefcn,y0,tspan,p[1:p_batch_size])
+    recsolver = Sundials.CVODE_BDF(linear_solver=:GMRES)
+    push!(reactor_list, Reactor(domain,ode,recsolver,true))
+
+    for i in 2:n_batches-1
+        odefcn = ODEFunction((dy, y, batch_p, t) -> dydt(dy, y, [p[1:(i-1)*p_batch_size];batch_p; p[i*p_batch_size+1:end]], t))
+        ode = ODEForwardSensitivityProblem(odefcn,y0,tspan,p[(i-1)*p_batch_size+1:i*p_batch_size])
+        recsolver = Sundials.CVODE_BDF(linear_solver=:GMRES)
+        push!(reactor_list, Reactor(domain,ode,recsolver,true))
+    end
+
+    odefcn = ODEFunction((dy, y, batch_p, t) -> dydt(dy, y, [p[1:(n_batches-1)*p_batch_size]; batch_p], t))
+    ode = ODEForwardSensitivityProblem(odefcn,y0,tspan,p[(n_batches-1)*p_batch_size+1:end])
+    recsolver = Sundials.CVODE_BDF(linear_solver=:GMRES)
+    push!(reactor_list, Reactor(domain,ode,recsolver,true))
+
+    return reactor_list
+end
+
+# Use this proceedure to test out the small model
+function threaded_fd_proceedure(rms_domain, u0, ts, params; batch_size=8)
+    threaded_fd_react_list = ThreadedFDReactor(rms_domain,u0,ts; p=params, p_batch_size=batch_size)
+    solution_dictionary = Dict()
+
+    @threads for i in 1:length(threaded_fd_react_list)
+      sol = solve(threaded_fd_react_list[i].ode, CVODE_BDF(), abstol=1e-20,reltol=1e-12)
+      solution_dictionary[i] = sol
+    end
+    return solution_dictionary
+end
+
+# Use this proceedure to test out the medium model, as the timing for all 1000+ parameters takes too long
+function threaded_fd_proceedure_limited(rms_domain, u0, ts, params; batch_size=8)
+    threaded_fd_react_list = ThreadedFDReactor(rms_domain,u0,ts; p=params, p_batch_size=batch_size)
+    solution_dictionary = Dict()
+
+    # Do 64 parameters in total, so adjust number of iteration to match based on batch size
+    last_batch = Int64(64/batch_size)
+    @threads for i in 1:last_batch
+      sol = solve(threaded_fd_react_list[i].ode, CVODE_BDF(), abstol=1e-20,reltol=1e-12)
+      solution_dictionary[i] = sol
+    end
+    return solution_dictionary
+end
+
+b_size = 4
+n_spcs = length(y0)
+tf = 1e-3
+threaded_fd_proceedure(domain, y0, (0.0, tf), all_params; batch_size=b_size)
+@btime threaded_fd_proceedure(domain, y0, (0.0, tf), all_params; batch_size=b_size)
+# Results on Personal laptop: 2 threads, 16 GB RAM
+# b_size 32: 26.815 s (74588670 allocations: 31.74 GiB)
+# b_size 16: 12.261 s (44988400 allocations: 18.54 GiB)
+# b_size 8: 7.811 s (29134813 allocations: 11.58 GiB)
+# b_size 4: 5.886 s (23357265 allocations: 8.59 GiB)
+# b_size 2: 5.939 s (24291380 allocations: 7.93 GiB)
+# b_size 1: 7.570 s (31433712 allocations: 8.98 GiB)
+
+
+# Verify that the data matches
+t_sens = 1e-4
+threaded_fd_sol_dict = threaded_fd_proceedure(domain, y0, (0.0, 1e-3), all_params; batch_size=b_size)
+isapprox(threaded_fd_sol_dict[1](t_sens), baseline_sol(t_sens)[1:n_spcs+b_size*n_spcs])
+isapprox(threaded_fd_sol_dict[2](t_sens)[1:n_spcs], baseline_sol(t_sens)[1:n_spcs])
+isapprox(threaded_fd_sol_dict[2](t_sens)[n_spcs+1:end], baseline_sol(t_sens)[n_spcs+1*b_size*n_spcs+1:n_spcs+2*b_size*n_spcs])
+isapprox(threaded_fd_sol_dict[3](t_sens)[28:end], baseline_sol(t_sens)[n_spcs+2*b_size*n_spcs+1:n_spcs+3*b_size*n_spcs])
+n_batches = length(threaded_fd_sol_dict)
+final_sens = threaded_fd_sol_dict[n_batches](t_sens)[n_spcs+1:end]
+isapprox(final_sens, baseline_sol(t_sens)[end-length(final_sens)+1:end])
+# All checks passed, regardless of model or batch size
+
+```
+
+
+# Parallelization strategy 2: Using interpolated forward solution
+
+```julia
+function ThreadedSA(domain::T,y0::Array{W,1},tspan::Tuple, fsol, interfaces::Z=[];p::X=DiffEqBase.NullParameters()) where {T<:AbstractDomain,W<:Real,Z<:AbstractArray,X}
+    # Previously implement in RMS
+    jacy!(J::Q2,y::T,p::V,t::Q) where {Q2,T,Q<:Real,V} = jacobiany!(J,y,p,t,domain,interfaces,nothing)
+    jacp!(J::Q2,y::T,p::V,t::Q) where {Q2,T,Q<:Real,V} = jacobianp!(J,y,p,t,domain,interfaces,nothing)
+
+    # My implementation
+    function dsdt(p_index)
+        function dsdt!(ds, s, local_params, t)
+            jy = zeros(length(y0), length(y0))
+            jp = zeros(length(y0), length(p))
+            jacy!(jy, fsol(t), p, t)
+            jacp!(jp, fsol(t), p, t)
+            c = jp[:, p_index]
+            ds .= jy*s .+ c
+        end
+        return dsdt!
+    end
+
+    # Create list of ODEProblems for each batch of parameters
+    sa_list = []
+
+    for i in 1:length(p)
+        odefcn = ODEFunction(dsdt(i))
+        prob = ODEProblem(odefcn, zeros(length(y0)),tspan,0)
+        push!(sa_list, prob)
+    end
+    return sa_list
+end
+
+
+phaseDict = readinput("small_model/chem.rms")
+phaseDict["phase"]["Species"]
+ig = IdealGas(phaseDict["phase"]["Species"], phaseDict["phase"]["Reactions"], name="gas")
+ic = Dict(["T"=>1350.0,"P"=>1e5,"ethane"=>1.0])
+domain, y0, all_params = ConstantTPDomain(phase=ig,initialconds=ic;sensitivity=false)
+
+f_react = Reactor(domain,y0,(0.0,1e-3); p=all_params)
+f_sol = solve(f_react.ode, CVODE_BDF(), abstol=1e-20,reltol=1e-12)
+f_sol(0.0)
+
+sa_list = ThreadedSA(domain, y0, (0.0,1e-3), f_sol; p=all_params)
+sa_30 = solve(sa_list[30], CVODE_BDF(), abstol=1e-20,reltol=1e-12)
+sa_30(1e-3)
+isapprox(baseline_sol(1e-3)[27+29*27+1:27+30*27], sa_30(1e-3))
+
+@btime solve(sa_list[30], CVODE_BDF(), abstol=1e-20,reltol=1e-12)
+
+function threaded_sa_proceedure(rms_domain, u0, ts, params)
+    f_react = Reactor(rms_domain,u0,ts; p=params)
+    f_sol = solve(f_react.ode, CVODE_BDF(), abstol=1e-20,reltol=1e-12)
+
+    sa_list = ThreadedSA(rms_domain, u0, ts, f_sol; p=params)
+
+    # Parallelize the SA calculations
+    solution_dictionary = Dict()
+
+    @threads for i in 1:length(params)
+        s = solve(sa_list[i], CVODE_BDF(), abstol=1e-20,reltol=1e-12)
+        solution_dictionary[i] = s
+    end
+
+    return solution_dictionary
+end
+
+@btime threaded_sa_proceedure(domain, y0, (0.0, 1e-3), all_params)
+# 11.899 s (65982402 allocations: 15.89 GiB)
+# 13.310 s (65824292 allocations: 15.88 GiB)
+# 11.978 s (65824149 allocations: 15.88 GiB)
+
+# Check for correctness
+sa_sol = threaded_sa_proceedure(domain, y0, (0.0, 1e-3), all_params)
+
+function sa_correctness(i)
+    return isapprox(baseline_sol(5e-4)[27+(i-1)*27+1:27+i*27], sa_sol[i](5e-4), atol=1e-14)
+end
+
+for i in 1:96
+    if !sa_correctness(i)
+        println("Errored for $i")
+        break
+    end
+end
+
+
+```
+
+# Adjoint SA parallelization
+
+```julia
+# Native RMS API Calls
+phaseDict = readinput("small_model/chem.rms")
+phaseDict["phase"]["Species"]
+ig = IdealGas(phaseDict["phase"]["Species"], phaseDict["phase"]["Reactions"], name="gas")
+ic = Dict(["T"=>1350.0,"P"=>1e5,"ethane"=>1.0])
+domain, y0, all_params = ConstantTPDomain(phase=ig,initialconds=ic;sensitivity=false)
+
+adjoint_react = Reactor(domain,y0,(0.0,1e-3); p=all_params)
+adjoint_sol = solve(adjoint_react.ode, CVODE_BDF(), abstol=1e-20,reltol=1e-12)
+
+# Test out existing adjoint method in RMS
+adjoint_bsol = Simulation(adjoint_sol, domain)
+ethane_sa = getadjointsensitivities(adjoint_bsol, "ethane", CVODE_BDF(); abstol=1e-8,reltol=1e-6,
+                                    sensealg=InterpolatingAdjoint(autojacvec=ReverseDiffVJP(true))
+                                    ))
+
+
+# Setup parallel problem
+spcs_list = [s.name for s in phaseDict["phase"]["Species"]]
+spcs_list = spcs_list[5:end]  # First 4 species are in the actual model
+
+function adjoint_parallelization_proceedure(rms_domain, u0, ts, params, spcs_list, atol, rtol)
+    # Solve for solution variables first
+    adjoint_react = Reactor(rms_domain,u0,ts; p=params)
+    adjoint_sol = solve(adjoint_react.ode, CVODE_BDF(), abstol=1e-20,reltol=1e-12)
+
+    # Loop over species to calculate all rows of the SA matrix
+    solution_dictionary = Dict()
+
+    @threads for spc in spcs_list
+        adj_sa = getadjointsensitivities(adjoint_bsol, spc, CVODE_BDF();
+                                         sensealg=InterpolatingAdjoint(autojacvec=ReverseDiffVJP(true)),abstol=atol,reltol=rtol)
+        solution_dictionary[spc] = adj_sa
+    end
+    return solution_dictionary
+end
+
+# This took a while with 2 threads on my PC
+adjoint_parallelization_proceedure(domain, y0, (0.0, 1e-3), all_params, spcs_list, 1e-20, 1e-12)
+
+
+# Profile time for a single iteration for each thread
+@btime adjoint_parallelization_proceedure(domain, y0, (0.0, 1e-3), all_params, spcs_list[3:4], 1e-20, 1e-12)
+# Tolerances: abstol=1e-20,reltol=1e-12
+# 3.207 s (9555246 allocations: 3.58 GiB) spcs_list[1:2]
+# 293.174 s (522113362 allocations: 224.46 GiB)  spcs_list[3:4] !!!! Not an even workload
+
+
+# Lower tolerances
+
+adjoint_parallelization_proceedure(domain, y0, (0.0, 1e-3), all_params, spcs_list, 1e-8, 1e-6)
+
+
+# Profile time for a single iteration for each thread
+@btime adjoint_parallelization_proceedure(domain, y0, (0.0, 1e-3), all_params, spcs_list, 1e-8, 1e-6)
+# 3.827 s (12711461 allocations: 4.50 GiB)
+
+
+
+# 138.962 s (476248103 allocations: 66.43 GiB) for 1e-10/1e-8
+```
+
+
+
+# Alternative IFPFSA
+
+```julia
+function ThreadedSA(domain::T,y0::Array{W,1},tspan::Tuple, fsol, interfaces::Z=[];params::X=DiffEqBase.NullParameters()) where {T<:AbstractDomain,W<:Real,Z<:AbstractArray,X}
+    # Previously implement in RMS
+    dydt(dy::X,y::T,p::V,t::Q) where {X,T,Q<:Real,V} = dydtreactor!(dy,y,t,domain,interfaces,p=p)
+
+    # My implementation
+    function dsdt(p_index)
+        function dsdt!(ds, s, local_params, t)
+            y(x) = dydt(convert(typeof(x), zeros(27)), x, convert(typeof(x), params), t)
+            jy = ForwardDiff.jacobian(y, f_sol(t))
+
+            function p(x)
+                new_params = convert(typeof(x), params)
+                new_params[p_index] = x[1]
+                u = f_sol(t)
+                return dydt(convert(typeof(x), zeros(27)), convert(typeof(x), u), new_params, t)
+            end
+
+            jp = ForwardDiff.jacobian(p, [params[p_index]])
+            ds .= jy*s .+ jp[:, 1]
+        end
+        return dsdt!
+    end
+
+    # Create list of ODEProblems for each batch of parameters
+    sa_list = []
+
+    for i in 1:length(params)
+        odefcn = ODEFunction(dsdt(i))
+        prob = ODEProblem(odefcn, zeros(length(y0)),tspan,0)
+        push!(sa_list, prob)
+    end
+    return sa_list
+end
+
+phaseDict = readinput("small_model/chem.rms")
+phaseDict["phase"]["Species"]
+ig = IdealGas(phaseDict["phase"]["Species"], phaseDict["phase"]["Reactions"], name="gas")
+ic = Dict(["T"=>1350.0,"P"=>1e5,"ethane"=>1.0])
+domain, y0, all_params = ConstantTPDomain(phase=ig,initialconds=ic;sensitivity=false)
+
+f_react = Reactor(domain,y0,(0.0,1e-3); p=all_params)
+f_sol = solve(f_react.ode, CVODE_BDF(), abstol=1e-20,reltol=1e-12)
+f_sol(0.0)
+
+sa_list = ThreadedSA(domain, y0, (0.0,1e-3), f_sol; params=all_params)
+sa_30 = solve(sa_list[30], CVODE_BDF(), abstol=1e-20,reltol=1e-12)
+sa_30(1e-3)
+isapprox(baseline_sol(1e-3)[27+29*27+1:27+30*27], sa_30(1e-3))
+
+@btime solve(sa_list[30], CVODE_BDF(), abstol=1e-20,reltol=1e-12)
+
+function threaded_sa_proceedure(rms_domain, u0, ts, params)
+    f_react = Reactor(rms_domain,u0,ts; p=params)
+    f_sol = solve(f_react.ode, CVODE_BDF(), abstol=1e-20,reltol=1e-12)
+
+    sa_list = ThreadedSA(rms_domain, u0, ts, f_sol; params=params)
+
+    # Parallelize the SA calculations
+    solution_dictionary = Dict()
+
+    @threads for i in 1:length(params)
+        s = solve(sa_list[i], CVODE_BDF(), abstol=1e-20,reltol=1e-12)
+        solution_dictionary[i] = s
+    end
+
+    return solution_dictionary
+end
+
+@btime threaded_sa_proceedure(domain, y0, (0.0, 1e-3), all_params)
+# 35.495 s (110980552 allocations: 75.12 GiB)
+# vs
+# 11.899 s (65982402 allocations: 15.89 GiB)
+# 13.310 s (65824292 allocations: 15.88 GiB)
+# 11.978 s (65824149 allocations: 15.88 GiB)
+
+# Check for correctness
+sa_sol = threaded_sa_proceedure(domain, y0, (0.0, 1e-3), all_params)
+
+function sa_correctness(i)
+    return isapprox(baseline_sol(5e-4)[27+(i-1)*27+1:27+i*27], sa_sol[i](5e-4), atol=1e-14)
+end
+
+for i in 1:96
+    if !sa_correctness(i)
+        println("Errored for $i")
+        break
+    end
+end
+
+
+```
+
+
+
+
+# Plots
+
+```julia
+
+# Plot 1: SFSA batch size 2, vs nthreads, small model
+p1_threads = [2;4;8;16;32]
+p1_sfsa = [5.327;4.867;4.674;5.840;7.931]
+
+scatter(p1_threads, p1_sfsa, xlabel="Number of threads",
+        ylabel="Total Time [s]", ylims=(0.0, 10.0), legend=false
+        )
+
+savefig("plot1.pdf")
+
+
+# Plot 2: SFSA 2 threads, vs batch size, small model. Include memory usage
+p2_batch_size = [2;4;8;16;32]
+p2_times = [5.327;4.938;7.288;11.202;20.515]
+p2_mem = [7.97;8.62;11.55;18.89;31.06]
+
+scatter(p2_batch_size, p2_times, xlabel="Number of threads",
+        ylabel="Total Time [s] / Memory [GB]", ylims=(0.0, 30.0), label="time"
+        )
+
+scatter!(p2_batch_size, p2_mem, xlabel="Number of threads",
+         ylims=(0.0), label="memory",
+        )
+
+savefig("plot2.pdf")
+
+# Plot 3: SFSA 2 threads, vs batch size, 64 params, medium model. Include memory usage
+p3_batch_size = [2;4;8;16]
+p3_times = [207.008;276.098;428.798;775.602]
+p3_mem = [697.19;901.81;1361.90;2340.54]
+
+scatter(p3_batch_size, p3_times, xlabel="Number of threads",
+        ylabel="Total Time [s] / Memory [GB]", ylims=(0.0, 3000.0), label="time"
+        )
+
+scatter!(p3_batch_size, p3_mem, xlabel="Number of threads",
+         xlims=(0, 20), label="memory",
+        )
+
+savefig("plot3.pdf")
+
+# Plot 4: SFSA batch size 2, vs threads, 256 params, medium model
+p4_threads = [2;4;8;16;32]
+p4_times = [820.699;478.504;278.322;192.761;137.059]
+
+scatter(p4_threads, p4_times, xlabel="Number of threads",
+        ylabel="Total Time [s]", ylims=(0.0, 1000.0), legend=false
+        )
+
+savefig("plot4.pdf")
+
+# Plot 5: IFPFSA batch size 1 + SFSA batch size 4, vs threads, small_model
+p5_threads = [2;4;8;16;32]
+p5_ifpfsa = [10.359;9.681;9.933;11.763;12.155]
+p5_sfsa = [4.938;4.659;4.485;5.398;5.564]
+
+scatter(p5_threads, p5_ifpfsa, xlabel="Number of threads",
+        ylabel="Total Time [s]", ylims=(0.0, 15.0), label="IFPFSA"
+        )
+
+scatter!(p5_threads, p5_sfsa,
+         label="SFSA",
+        )
+
+savefig("plot5.pdf")
+
+# Plot 6: IFPFSA batch size 1 + SFSA batch size 1, vs threads, medium_model, 256 params
+p6_threads = [2;4;8;16;32]
+p6_ifpfsa = [137.681;102.163;66.281;43.866;35.624]
+p6_sfsa = [907.469;513.775;304.184;205.080;162.860]
+
+scatter(p6_threads, p6_ifpfsa, xlabel="Number of threads",
+        ylabel="Total Time [s]", ylims=(0.0, 1000.0), label="IFPFSA"
+        )
+
+scatter!(p6_threads, p6_sfsa, label="SFSA",
+        )
+
+savefig("plot6.pdf")
+
+# Plot 7: ASA + SFSA batch size 4, vs threads, small
+p7_threads = [2;4;8;16;32]
+p7_asa = [4.377;3.396;2.638;2.548;3.289]
+p7_sfsa = [4.938;4.659;4.485;5.398;5.564]
+
+scatter(p7_threads, p7_asa, xlabel="Number of threads",
+        ylabel="Total Time [s]", ylims=(0.0, 10.0), label="ASA"
+        )
+
+scatter!(p7_threads, p7_sfsa, label="SFSA",
+        )
+
+savefig("plot7.pdf")
+
+# Plot 8: ASA vs threads, medium
+p8_threads = [2;4;8;16]
+p8_asa = [961.660;835.570;594.882;544.856]
+
+scatter(p8_threads, p8_asa, xlabel="Number of threads",
+        ylabel="Total Time [s]", ylims=(0.0, 1000.0), legend=false
+        )
+
+savefig("plot8.pdf")
+
+
+
+
+```

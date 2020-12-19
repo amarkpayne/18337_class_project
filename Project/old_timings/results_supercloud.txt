@@ -1,0 +1,38 @@
+# Supercloud results
+
+ ## Baseline
+  ### Minimal Example
+   58.384 s (179460404 allocations: 67.94 GiB)
+   58.268 s (179460404 allocations: 67.94 GiB)
+   58.333 s (179460404 allocations: 67.94 GiB)
+
+ ## Threaded_fd
+  ### Minimal Example
+   ### Maximum threads for each b_size
+     b_size 2: 48
+     b_size 4: 24
+     b_size 8: 12
+     b_size 16: 6
+     b_size 32: 3
+
+   ### 2 threads
+    b_size 2: 6.303 s (24401522 allocations: 7.97 GiB)
+    b_size 4: 4.943 s (23421881 allocations: 8.62 GiB)
+    b_size 8: 6.633 s (28882903 allocations: 11.55 GiB)
+
+
+   ### 4 threads
+    b_size 2: 4.916 s (24401536 allocations: 7.97 GiB)
+    b_size 8: 5.920 s (28882910 allocations: 11.55 GiB)
+
+   ### 8 threads
+    b_size 2: 4.753 s (24401552 allocations: 7.97 GiB)
+    b_size 8: 6.229 s (28882952 allocations: 11.55 GiB)
+
+   ### 16 threads
+    b_size 2: 5.811 s (24401593 allocations: 7.97 GiB)
+    #b_size 8: 6.904 s (28882994 allocations: 11.55 GiB)
+
+   ### 32 threads
+    b_size 2: 8.266 s (24401680 allocations: 7.97 GiB)
+    #b_size 8: 7.043 s (28883077 allocations: 11.55 GiB)

@@ -1,0 +1,26 @@
+Using 2 threads
+Profiling threaded proceedure for 2 threads and a b_size of 2
+  820.699 s (364136865 allocations: 2791.13 GiB)
+Using 4 threads
+Profiling threaded proceedure for 4 threads and a b_size of 2
+  478.504 s (364137054 allocations: 2791.13 GiB)
+Using 8 threads
+Profiling threaded proceedure for 8 threads and a b_size of 2
+  278.322 s (364136985 allocations: 2791.13 GiB)
+Using 16 threads
+Profiling threaded proceedure for 16 threads and a b_size of 2
+  192.761 s (364137253 allocations: 2791.13 GiB)
+Using 32 threads
+Profiling threaded proceedure for 32 threads and a b_size of 2
+  137.059 s (364136939 allocations: 2791.13 GiB)
+
+
+
+
+## Don't use, the nodes only has 40 cores, these were hyperthreaded
+Using 64 threads
+Profiling threaded proceedure for 64 threads and a b_size of 2
+  148.100 s (364137783 allocations: 2791.13 GiB)
+Using 80 threads
+Profiling threaded proceedure for 80 threads and a b_size of 2
+  206.165 s (364138098 allocations: 2791.13 GiB)
